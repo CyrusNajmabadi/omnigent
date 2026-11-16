@@ -34,6 +34,7 @@ from omnigent.runner import create_runner_app
 from omnigent.runner.environment_filesystem import CallerProcessFilesystem, search_indexed_paths
 from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.runtime.filesystem_registry import GitFilesystemRegistry
+from omnigent.spec.types import AgentSpec, ExecutorSpec
 from tests.runner.helpers import NullServerClient
 
 
@@ -1781,10 +1782,10 @@ async def test_filesystem_endpoints_return_404_when_spec_has_no_os_env(
         assert request.url.path == "/v1/sessions/conv_test"
         return httpx.Response(200, json={"id": "conv_test", "agent_id": "ag_no_env"})
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> object:
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         """Return a spec with no os_env for the agent under test."""
         assert agent_id == "ag_no_env"
-        return SimpleNamespace(os_env=None)
+        return AgentSpec(spec_version=1, name="no-env", executor=ExecutorSpec(), os_env=None)
 
     server_client = httpx.AsyncClient(
         transport=httpx.MockTransport(_session_handler),
