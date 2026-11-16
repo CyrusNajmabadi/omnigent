@@ -12,7 +12,8 @@ import pytest
 
 from omnigent.runner import create_runner_app
 from omnigent.runner.app import ResolvedSpec
-from omnigent.spec.types import AgentSpec, ExecutorSpec, SkillSpec
+from omnigent.runner.journal_tools import invalidate_server_workflow_flag
+from omnigent.spec.types import AgentSpec, ExecutorSpec, SkillSpec, ToolGroupsConfig
 
 
 @pytest.fixture(autouse=True)
@@ -57,6 +58,7 @@ class _ServerClient:
         :param workspace: Session workspace path to report, or ``None``.
         """
         self._workspace = workspace
+        self.workflows_enabled = False
 
     class _Response:
         """Stub 200 snapshot response with an agent_id + workspace."""
@@ -72,13 +74,14 @@ class _ServerClient:
             """:returns: A minimal session snapshot."""
             return {"agent_id": "ag_x", "workspace": self._workspace}
 
-    async def get(self, url: str, **kwargs: Any) -> _Response:
+    async def get(self, url: str, **kwargs: Any) -> _Response | httpx.Response:
         """
         :param url: Request URL (ignored).
         :param kwargs: Extra kwargs (ignored).
         :returns: The stub snapshot response.
         """
-        del url, kwargs
+        if url == "/v1/info":
+            return httpx.Response(200, json={"features": {"workflows": self.workflows_enabled}})
         return self._Response(self._workspace)
 
 
@@ -90,6 +93,8 @@ def _make_app(
     workspace: Path | None = None,
     resolver_calls: list[str] | None = None,
     harness: str = "claude-sdk",
+    journal_enabled: bool = False,
+    server_client: _ServerClient | None = None,
 ):  # type: ignore[no-untyped-def]
     """
     Build a runner app whose spec resolver returns a bundled spec.
@@ -112,6 +117,7 @@ def _make_app(
         skills=bundled,
         skills_filter=skills_filter,
         executor=ExecutorSpec(config={"harness": harness}),
+        tool_groups=ToolGroupsConfig(journal=journal_enabled),
     )
     entry = ResolvedSpec(spec=spec, workdir=bundle_dir)
 
@@ -123,7 +129,8 @@ def _make_app(
 
     return create_runner_app(
         spec_resolver=_spec_resolver,
-        server_client=_ServerClient(str(workspace) if workspace is not None else None),  # type: ignore[arg-type]
+        server_client=server_client
+        or _ServerClient(str(workspace) if workspace is not None else None),  # type: ignore[arg-type]
     )
 
 
@@ -137,6 +144,41 @@ async def _client(app: Any) -> AsyncIterator[httpx.AsyncClient]:
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://runner") as c:
         yield c
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("journal_enabled", [False, True])
+@pytest.mark.parametrize("custom", [False, True])
+async def test_workflow_slash_resolution_follows_the_server_flag(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    journal_enabled: bool,
+    custom: bool,
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+    server = _ServerClient(str(tmp_path))
+    bundled = (
+        [SkillSpec(name="workflow", description="My workflow", content="User instructions")]
+        if custom
+        else []
+    )
+    app = _make_app(
+        tmp_path, bundled, "none", server_client=server, journal_enabled=journal_enabled
+    )
+    async for client in _client(app):
+        for enabled in (False, True, False):
+            server.workflows_enabled = enabled
+            invalidate_server_workflow_flag(server)
+            for name in ("workflow", "save-workflow"):
+                response = await client.post(
+                    "/v1/sessions/conv_workflow/skills/resolve", json={"name": name}
+                )
+                own = custom and name == "workflow"
+                assert response.status_code == (
+                    200 if own or (enabled and journal_enabled) else 404
+                )
+                if own:
+                    assert "User instructions" in response.json()["meta_text"]
 
 
 @pytest.mark.asyncio

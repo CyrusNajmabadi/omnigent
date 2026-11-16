@@ -106,6 +106,7 @@ from omnigent.server.bundles import agent_needs_own_copy, copy_agent_bundle, val
 from omnigent.server.creation_logging import creation_metadata, creation_stage, session_created
 from omnigent.server.feature_flags import Feature
 from omnigent.server.host_registry import HostLaunchResult, HostRegistry, RunnerExitReports
+from omnigent.server.openapi_request_bodies import SESSION_CREATE_OPENAPI_EXTRA
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import SessionAccess
 from omnigent.server.routes._auth_helpers import (
@@ -293,7 +294,7 @@ from omnigent.stores.conversation_store import (
 )
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import host_is_live
-from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.permission_store import PermissionStore, read_all_grants
 from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.session_pull_request_store import SessionSummary
 from omnigent.telemetry.surface import CLIENT_SURFACE_LABEL_KEY, resolve_session_surface
@@ -665,15 +666,10 @@ def register_core_routes(
     async def _list_session_grants(session_id: str) -> dict[str, int]:
         """Every grant on *session_id*, as grantee to level."""
         assert permission_store is not None
-        levels: dict[str, int] = {}
-        after: str | None = None
-        while True:
-            grants, after = await asyncio.to_thread(
-                permission_store.list_for_session, session_id, limit=500, after_user_id=after
-            )
-            levels.update((grant.user_id, grant.level) for grant in grants)
-            if after is None:
-                return levels
+        grants = await asyncio.to_thread(
+            read_all_grants, permission_store.list_for_session, session_id
+        )
+        return {grant.user_id: grant.level for grant in grants}
 
     async def _copy_session_grants(source_id: str, target_id: str) -> None:
         """Give *target_id*, a session created with no grants, exactly *source_id*'s."""
@@ -1433,6 +1429,7 @@ def register_core_routes(
             Depends(require_json_or_multipart_content_type),
             Depends(require_trusted_origin),
         ],
+        openapi_extra=SESSION_CREATE_OPENAPI_EXTRA,
     )
     async def create_session(
         request: Request,
@@ -1651,8 +1648,20 @@ def register_core_routes(
             else:
                 body.sibling_source_id = sibling_source.id
                 body.project_id = sibling_source.project_id
+        launching_task = None
+        if source is not None:
+            from omnigent.server.scheduled.run_sharing import launching_automation
+
+            # An agent's launch from an automation run's tree joins that automation's runs.
+            launching_task = await asyncio.to_thread(
+                launching_automation,
+                source,
+                user_id=user_id,
+                conversation_store=conversation_store,
+                scheduled_task_store=getattr(request.app.state, "scheduled_task_store", None),
+            )
         creation_metadata(parent_session_id=body.parent_session_id, host_type=body.host_type)
-        resp, conv = await _create_session_from_existing_agent(
+        resp, conv, resolved_body = await _create_session_from_existing_agent(
             conversation_store,
             agent_store,
             runner_router,
@@ -1672,6 +1681,9 @@ def register_core_routes(
                 source.labels.get(SCHEDULED_TASK_ORIGIN_LABEL_KEY) if source is not None else None
             ),
             created_by_labels=source.labels if source is not None else None,
+            launched_by_scheduled_task_id=(
+                launching_task.id if launching_task is not None else None
+            ),
         )
         # Notify the runner about the new session so it can resolve
         # the spec and cache sub_agent_name before the first turn.
@@ -1760,6 +1772,21 @@ def register_core_routes(
                     LEVEL_OWNER,
                 )
             resp.permission_level = grant.level
+        if launching_task is not None and conv is not None and source is not None:
+            from omnigent.server.scheduled.run_sharing import share_launched_session
+
+            # Before the first input is saved: a sandbox host's recovery may deliver it at
+            # once, and the worker's own launches need these grants. A failed save deletes
+            # the session with its grants, and recipients' lists drop it.
+            await share_launched_session(
+                launching_task,
+                conv,
+                launched_from_root=source.root_conversation_id,
+                managed=resolved_body.host_type == "managed",
+                permission_store=permission_store,
+                app_state=request.app.state,
+                host_registry=getattr(request.app.state, "host_registry", None),
+            )
         await _accept_initial_input(request, resp.id, body.initial_input, user_id)
         # Managed host: schedule a BACKGROUND sandbox provision bound
         # to this session and return immediately — provisioning takes
@@ -1772,15 +1799,15 @@ def register_core_routes(
         # synchronously.
         launch_host_id = body.host_id
         try:
-            if body.host_type == "managed" and resp.runner_id is None:
+            if resolved_body.host_type == "managed" and resp.runner_id is None:
                 await _schedule_managed_launch(
                     request,
                     session_id=resp.id,
                     agent_id=conv.agent_id if conv is not None else None,
                     user_id=user_id,
-                    sandbox_provider=body.sandbox_provider,
-                    workspaces=body.managed_repo_workspaces(),
-                    requested_host_id=body.requested_host_id,
+                    sandbox_provider=resolved_body.sandbox_provider,
+                    workspaces=resolved_body.managed_repo_workspaces(),
+                    requested_host_id=resolved_body.requested_host_id,
                 )
         finally:
             # Push the new session to this user's other open tabs (see the
@@ -1916,6 +1943,7 @@ def register_core_routes(
         )
         from omnigent.server.routes._session_create_validation import (
             resolve_project_session_create,
+            server_sandbox_providers,
         )
 
         if (
@@ -1928,6 +1956,7 @@ def register_core_routes(
             body=parsed_metadata,
             user_id=user_id,
             project_store=project_store,
+            launchable_sandbox_providers=server_sandbox_providers(request),
         )
         parsed_metadata = project_resolution.body
         await _check_initial_input(request, parsed_metadata.initial_input)

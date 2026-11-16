@@ -294,6 +294,7 @@ describe.each([
   "scheduled_task_trigger_headers",
   "scheduled_task_sandbox_workspaces",
   "scheduled_task_inbox",
+  "scheduled_task_sharing",
 ] as const)("resolveServerInfo %s", (capability) => {
   it.each([
     [true, true],
@@ -548,10 +549,7 @@ describe("custom agents settings capability", () => {
   it.each([undefined, false, "true", true])(
     "requires a boolean install capability: %s",
     async (install) => {
-      const parsed = await probe({
-        features: { custom_agents_settings_ui: true },
-        agent_install: install,
-      });
+      const parsed = await probe({ agent_install: install });
       const { customAgentsSettingsEnabled } = await import("./capabilities");
       expect(customAgentsSettingsEnabled(parsed)).toBe(install === true);
     },
